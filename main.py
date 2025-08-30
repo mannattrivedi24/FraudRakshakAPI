@@ -672,8 +672,9 @@ def _worker_deep_scan(loop: asyncio.AbstractEventLoop, scan_id: str, apk_path: s
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
             _push_progress_from_thread(loop, scan_id, f"Cleaned temp dir {temp_dir}")
-        except Exception:
+        except Exception: 
             pass
+            
 
 @app.post("/deep_scan/{scan_id}/", summary="Deep APK scan", description="Start decompile + YARA in background (non-blocking)")
 async def deep_scan(scan_id: str):
@@ -869,3 +870,29 @@ async def get_deep_result(scan_id: str):
 
     return {"scan_id": scan_id, "status": record.get("status"), "deep_scan_result": deep, "deep_scan_verdict": verdict}
 
+@app.delete("/delete_apk/{scan_id}/", summary="Delete APK by Scan ID", description="Deletes the APK file from server and removes its record from DB")
+async def delete_apk(scan_id: str):
+    # Fetch scan record
+    record = await scans_collection.find_one({"scan_id": scan_id})
+    if not record:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+
+    apk_path = record.get("apk_path")
+
+    # Delete the APK file from disk if it exists
+    if apk_path and os.path.exists(apk_path):
+        try:
+            os.remove(apk_path)
+            # Also cleanup parent tmpdir if empty
+            parent_dir = os.path.dirname(apk_path)
+            try:
+                os.rmdir(parent_dir)  # removes only if empty
+            except OSError:
+                pass
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete APK file: {e}")
+
+    # Delete record from MongoDB
+    await scans_collection.delete_one({"scan_id": scan_id})
+
+    return {"scan_id": scan_id, "status": "deleted"}
