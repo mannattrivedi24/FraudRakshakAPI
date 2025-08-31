@@ -2,6 +2,7 @@ from pymongo import AsyncMongoClient
 import os
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 import logging
 import tempfile, os, subprocess, re, uuid
 from fastapi.concurrency import run_in_threadpool
@@ -18,18 +19,6 @@ import shutil
 from datetime import datetime
 import yara
 
-
-# AAPT_PATH = r"C:\Users\manna\AppData\Local\Android\Sdk\build-tools\35.0.0\aapt.exe"
-AAPT_PATH = os.getenv("AAPT_PATH", "/android-sdk/build-tools/35.0.0/aapt")
-
-load_dotenv()
-
-MONGO_URI = os.getenv("MONGO_URI")
-client = AsyncMongoClient(MONGO_URI)
-db = client["apkscannerdb"]
-scans_collection = db["scan_details"]
-signature_collection = db["signatureCollection"]
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -45,6 +34,31 @@ async def lifespan(app: FastAPI):
     print("👋 MongoDB connection closed")
 
 app = FastAPI(lifespan=lifespan)
+
+
+origins = [
+    "http://localhost:3000",  # your frontend URL
+    "https://fraudrakshak.vercel.app", # production frontend URL
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # or ["*"] to allow all origins (not recommended for prod)
+    allow_credentials=True,
+    allow_methods=["*"],    # allow all HTTP methods
+    allow_headers=["*"],    # allow all headers
+)
+# # AAPT_PATH = r"C:\Users\manna\AppData\Local\Android\Sdk\build-tools\35.0.0\aapt.exe"
+# AAPT_PATH = os.getenv("AAPT_PATH", "/android-sdk/build-tools/35.0.0/aapt")
+AAPT_PATH = shutil.which("aapt")
+
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGO_URI")
+client = AsyncMongoClient(MONGO_URI)
+db = client["apkscannerdb"]
+scans_collection = db["scan_details"]
+signature_collection = db["signatureCollection"]
 
 def serialize_apk_details(details: dict) -> dict:
     """
@@ -116,6 +130,13 @@ async def scan_metadata(scan_id: str):
 
     # --- Fetch scan record ---
     record = await scans_collection.find_one({"scan_id": scan_id})
+    # If result already exists in DB, return it directly (skip processing)
+    if record and record.get("result") is not None:
+        return {
+            "scan_id": scan_id,
+            "status": "metadata_scanned",
+            "result": record["result"]
+        }
     if not record:
         print(f"[ERROR] No scan record found for scan_id={scan_id}")
         raise HTTPException(status_code=404, detail="Scan ID not found")
@@ -272,6 +293,12 @@ async def scan_signature(scan_id: str):
 
     # --- Fetch scan record ---
     record = await scans_collection.find_one({"scan_id": scan_id})
+    if record and record.get("signature_result") is not None:
+        return {
+            "scan_id": scan_id,
+            "status": "signature_scanned",
+            "result": record["signature_result"]
+        }
     if not record:
         print(f"[ERROR] No scan record found for scan_id={scan_id}")
         raise HTTPException(status_code=404, detail="Scan ID not found")
@@ -450,7 +477,7 @@ from datetime import datetime
 APKTOOL_JAR = os.getenv("APKTOOL_JAR", r"C:\Windows\apktool\apktool.jar")
 YARA_RULES_PATH = os.path.join(os.path.dirname(__file__), "apk_rules.yar")
 APKTOOL_TIMEOUT = int(os.getenv("APKTOOL_TIMEOUT", "900"))  # seconds
-SCAN_FILE_LIMIT = int(os.getenv("SCAN_FILE_LIMIT", "20000"))
+SCAN_FILE_LIMIT = int(os.getenv("SCAN_FILE_LIMIT", "100000"))
 PROGRESS_UPDATE_EVERY = int(os.getenv("PROGRESS_UPDATE_EVERY", "50"))
 
 # Helper used by the worker thread to schedule async DB updates on the main loop
@@ -679,6 +706,9 @@ def _worker_deep_scan(loop: asyncio.AbstractEventLoop, scan_id: str, apk_path: s
 @app.post("/deep_scan/{scan_id}/", summary="Deep APK scan", description="Start decompile + YARA in background (non-blocking)")
 async def deep_scan(scan_id: str):
     record = await scans_collection.find_one({"scan_id": scan_id})
+    # If deep_scan_result already exists, return status only (don't start new scan)
+    if record and record.get("deep_scan_result") is not None:
+        return {"scan_id": scan_id, "status": record.get("status")}
     if not record:
         raise HTTPException(status_code=404, detail="Scan ID not found")
 
@@ -893,6 +923,157 @@ async def delete_apk(scan_id: str):
             raise HTTPException(status_code=500, detail=f"Failed to delete APK file: {e}")
 
     # Delete record from MongoDB
-    await scans_collection.delete_one({"scan_id": scan_id})
-
+        await scans_collection.update_one(
+                {"scan_id": scan_id},
+                {"$set": {"apk_path": None, "status": "apk_deleted"}}
+            )
     return {"scan_id": scan_id, "status": "deleted"}
+
+@app.post("/patch_with_frida/{scan_id}/")
+async def patch_with_frida(scan_id: str):
+    print(f"[INFO] Starting Frida patch for scan_id={scan_id}")
+
+    record = await scans_collection.find_one({"scan_id": scan_id})
+    if not record: 
+        print(f"[ERROR] No scan record found for {scan_id}")
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+
+    apk_path = record["apk_path"]
+    if not apk_path or not os.path.exists(apk_path):
+        print(f"[ERROR] APK not found on disk: {apk_path}")
+        raise HTTPException(status_code=400, detail="APK not found")
+
+    tmpdir = tempfile.mkdtemp(prefix=f"frida_patch_{scan_id}_")
+    decoded = os.path.join(tmpdir, "decoded")
+    patched = os.path.join(tmpdir, "patched.apk")
+    print(f"[INFO] Working directory: {tmpdir}")
+
+    # 1) decode
+    print(f"[STEP] Running apktool decode on {apk_path}")
+    apktool_cmd = ["java", "-jar", APKTOOL_JAR, "d", "-f", apk_path, "-o", decoded]
+    subprocess.run(apktool_cmd, check=True)
+
+    # 2) inject gadget
+    arch = "x86"  # Genycloud free = x86 image
+    libdir = os.path.join(decoded, "lib", arch)
+    os.makedirs(libdir, exist_ok=True)
+
+    gadget_src = os.getenv("FRIDA_GADGET_PATH", "/app/frida-gadget.so")
+    if not os.path.exists(gadget_src):
+        print(f"[ERROR] Frida gadget not found at {gadget_src}")
+        raise HTTPException(status_code=500, detail=f"Frida gadget not found at {gadget_src}")
+
+    print(f"[STEP] Copying gadget from {gadget_src} -> {libdir}")
+    shutil.copy(gadget_src, os.path.join(libdir, "libfrida-gadget.so"))
+
+    # 3) add config
+    print(f"[STEP] Creating frida-gadget.config in assets/")
+    assets = os.path.join(decoded, "assets")
+    os.makedirs(assets, exist_ok=True)
+    config_path = os.path.join(assets, "frida-gadget.config")
+    with open(config_path, "w") as f:
+        f.write(json.dumps({
+            "interaction": {"type": "listen", "address": "0.0.0.0", "port": 27042}
+        }))
+    print(f"[INFO] Wrote frida-gadget.config at {config_path}")
+
+    # 4) rebuild
+    print("[STEP] Rebuilding APK with apktool")
+    subprocess.run(["java", "-jar", APKTOOL_JAR, "b", decoded, "-o", patched], check=True)
+    print(f"[INFO] Rebuilt APK at {patched}")
+
+    # 5) sign
+    signed = patched.replace(".apk", "_signed.apk")
+    keystore = os.getenv("DEBUG_KEYSTORE", "/app/debug.keystore")
+    print(f"[STEP] Signing APK with keystore={keystore}")
+    subprocess.run([
+        "apksigner", "sign",
+        "--ks", keystore,
+        "--ks-pass", "pass:android",
+        "--out", signed, patched
+    ], check=True)
+    print(f"[INFO] Signed APK saved at {signed}")
+
+    await scans_collection.update_one(
+        {"scan_id": scan_id},
+        {"$set": {
+            "patched_apk_path": signed,
+            "status": "frida_patched",
+            "updated_at": datetime.utcnow().isoformat()
+        }}
+    )
+    print(f"[SUCCESS] Patched APK ready for scan_id={scan_id}")
+
+    return {"scan_id": scan_id, "status": "frida_patched", "patched_apk": signed}
+
+from fastapi.responses import FileResponse
+
+@app.get("/download_patched/{scan_id}/", summary="Download patched APK")
+async def download_patched_apk(scan_id: str):
+    # 1️⃣ Find scan record
+    record = await scans_collection.find_one({"scan_id": scan_id})
+    if not record:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+
+    patched_apk_path = record.get("patched_apk_path")
+    if not patched_apk_path or not os.path.exists(patched_apk_path):
+        raise HTTPException(status_code=400, detail="Patched APK not found. Run /patch_with_frida first.")
+
+    # 2️⃣ Return the file
+    filename = f"{record.get('package_name', 'app')}_patched.apk"
+    return FileResponse(
+        path=patched_apk_path,
+        filename=filename,
+        media_type="application/vnd.android.package-archive"
+    )
+
+
+import aiohttp
+
+APPETIZE_API_KEY = os.getenv("APPETIZE_API_KEY")
+APPETIZE_API_URL = "https://api.appetize.io/v1/apps"
+
+@app.post("/dynamic_run/{scan_id}/", summary="Upload APK to Appetize", description="Uploads a previously uploaded APK directly to Appetize and returns publicKey")
+async def dynamic_run(scan_id: str):
+    scan_doc = await scans_collection.find_one({"scan_id": scan_id})
+    # If appetize_publicKey already exists, return it directly (skip upload)
+    if scan_doc and scan_doc.get("appetize_publicKey"):
+        return {
+            "scan_id": scan_id,
+            "publicKey": scan_doc.get("appetize_publicKey"),
+            "status": "uploaded_to_appetize"
+        }
+    if not scan_doc:
+        raise HTTPException(status_code=404, detail="Scan ID not found")
+
+    apk_path = scan_doc.get("apk_path")
+    if not apk_path or not os.path.exists(apk_path):
+        raise HTTPException(status_code=400, detail="APK file not found on server")
+
+    form_data = aiohttp.FormData()
+    form_data.add_field("file", open(apk_path, "rb"), filename=os.path.basename(apk_path))
+    form_data.add_field("platform", "android")
+    form_data.add_field("appPermissions.run", "public")
+    form_data.add_field("appPermissions.networkProxy", "public")
+    form_data.add_field("appPermissions.networkIntercept", "public")
+    form_data.add_field("appPermissions.debugLog", "public")
+    form_data.add_field("appPermissions.adbConnect", "public")
+    form_data.add_field("appPermissions.androidPackageManager", "public")
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            APPETIZE_API_URL,
+            headers={"X-API-KEY": APPETIZE_API_KEY},
+            data=form_data
+        ) as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise HTTPException(status_code=resp.status, detail=f"Appetize API error: {text}")
+            data = await resp.json()
+
+    await scans_collection.update_one(
+        {"scan_id": scan_id},
+        {"$set": {"appetize_publicKey": data.get("publicKey"), "status": "uploaded_to_appetize"}}
+    )
+
+    return {"scan_id": scan_id, "publicKey": data.get("publicKey"), "status": "uploaded_to_appetize"}

@@ -22,9 +22,9 @@ RUN mkdir -p /android-sdk/cmdline-tools && cd /android-sdk/cmdline-tools \
 ENV ANDROID_HOME=/android-sdk
 ENV PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/build-tools/35.0.0
 
+# Install build-tools + platform-tools (adb lives here)
 RUN yes | sdkmanager --sdk_root=${ANDROID_HOME} --licenses \
-    && sdkmanager --sdk_root=${ANDROID_HOME} "build-tools;35.0.0"
-
+    && sdkmanager --sdk_root=${ANDROID_HOME} "build-tools;35.0.0" "platform-tools"
 
 # Copy code
 WORKDIR /app
@@ -36,6 +36,7 @@ COPY . /app
 # Set env paths
 ENV APKTOOL_JAR=/usr/local/bin/apktool.jar
 ENV AAPT_PATH=/android-sdk/build-tools/35.0.0/aapt
+ENV ADB_PATH=/android-sdk/platform-tools/adb
 
 EXPOSE 8000
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
